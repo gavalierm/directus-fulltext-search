@@ -1,0 +1,31 @@
+export default {
+  id: 'fulltext-search',
+  name: 'Fulltext Search Index',
+  icon: 'search',
+  description: 'Build normalized fulltext column for diacritic/case-insensitive search',
+  overview: ({ collection }) => [
+    { label: 'Collection', text: collection || 'From trigger' },
+  ],
+  options: [
+    {
+      field: 'collection',
+      name: 'Collection',
+      type: 'string',
+      meta: {
+        width: 'half',
+        interface: 'input',
+        note: 'Leave empty to use {{$trigger.collection}}',
+      },
+    },
+    {
+      field: 'keys',
+      name: 'Keys',
+      type: 'json',
+      meta: {
+        width: 'half',
+        interface: 'input',
+        note: 'Leave empty to use {{$trigger.keys}}',
+      },
+    },
+  ],
+};

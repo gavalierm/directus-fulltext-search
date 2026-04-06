@@ -1,0 +1,25 @@
+{
+  "name": "directus-operation-fulltext-search",
+  "version": "1.0.0",
+  "description": "Build normalized fulltext index columns on item create/update",
+  "type": "module",
+  "directus:extension": {
+    "type": "operation",
+    "path": {
+      "app": "dist/app.js",
+      "api": "dist/api.js"
+    },
+    "source": {
+      "app": "src/app.js",
+      "api": "src/api.js"
+    },
+    "host": "^11.0.0"
+  },
+  "devDependencies": {
+    "@directus/extensions-sdk": "^17.1.0"
+  },
+  "scripts": {
+    "build": "npx directus-extension build",
+    "dev": "npx directus-extension build --watch"
+  }
+}
