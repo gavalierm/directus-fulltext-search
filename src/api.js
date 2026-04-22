@@ -56,6 +56,7 @@ const CONFIG = {
         parts.push(String(value));
         return parts.join(' ');
       },
+      lyrics: extractLyricsSearchable,
     },
     userCreated: true,
   },
@@ -97,6 +98,57 @@ function normalize(str) {
     .replace(PUNCTUATION_RE, ' ')
     .replace(WHITESPACE_RE, ' ')
     .trim();
+}
+
+// ===== LYRICS EXTRACTION =====
+
+const VERSE_ALIASES = /^(sloha|verse|vers)(\s*[\w\]]+)?$/i;
+const REFRAIN_ALIASES = /^(refren|refrén|chorus)(\s*[\w\]]+)?$/i;
+const CHORDS_RE = /\[[^\]]*\]/g;
+const MARKERS_RE = /\{[^}]*\}/g;
+
+function extractLyricsSearchable(lyrics) {
+  if (!lyrics || typeof lyrics !== 'string') return '';
+
+  const lines = lyrics.split(/\r?\n/);
+  const sections = [];
+  let current = null;
+
+  for (const line of lines) {
+    const headerMatch = line.match(/^#\s*(.+?)\s*$/);
+    if (headerMatch) {
+      if (current) sections.push(current);
+      current = { name: headerMatch[1].trim(), lines: [] };
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  if (current) sections.push(current);
+
+  function firstCleanLine(section) {
+    for (const raw of section.lines) {
+      const clean = raw
+        .replace(CHORDS_RE, '')
+        .replace(MARKERS_RE, '')
+        .trim();
+      if (clean.length >= 3) return clean;
+    }
+    return '';
+  }
+
+  const firstVerse = sections.find((s) => VERSE_ALIASES.test(s.name));
+  const firstRefrain = sections.find((s) => REFRAIN_ALIASES.test(s.name));
+
+  const verseLine = firstVerse ? firstCleanLine(firstVerse) : '';
+  const refrainLine = firstRefrain ? firstCleanLine(firstRefrain) : '';
+
+  const parts = [];
+  if (verseLine) parts.push(verseLine);
+  if (refrainLine && normalize(refrainLine) !== normalize(verseLine)) {
+    parts.push(refrainLine);
+  }
+
+  return parts.join(' ');
 }
 
 // ===== HANDLER =====
