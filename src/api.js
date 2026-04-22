@@ -83,12 +83,19 @@ const CONFIG = {
 
 // ===== NORMALIZE =====
 
+// MUST stay behaviorally identical to spevnik/src/lib/api/queries/_search.js#normalize
+const DIACRITICS_RE = /[\u0300-\u036f]/g;
+const PUNCTUATION_RE = /[\p{P}]+/gu;
+const WHITESPACE_RE = /\s+/g;
+
 function normalize(str) {
   if (str == null) return '';
   return String(str)
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(DIACRITICS_RE, '')
     .toLowerCase()
+    .replace(PUNCTUATION_RE, ' ')
+    .replace(WHITESPACE_RE, ' ')
     .trim();
 }
 
@@ -245,7 +252,8 @@ export default {
         }
 
         // 6. Write fulltext
-        const fulltext = parts.filter(Boolean).join(' ');
+        // Leading/trailing spaces enable word-boundary _icontains ' token' queries.
+        const fulltext = ' ' + parts.filter(Boolean).join(' ') + ' ';
         await database(collection).where('id', id).update({ fulltext });
 
         results.push({ id, fulltext });
