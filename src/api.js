@@ -188,6 +188,17 @@ export default {
       return { skip: true, reason: `Collection "${collection}" has no fulltext column` };
     }
 
+    // Optional: fulltext_title column for title-first ranking (not all deployments
+    // may have it yet). If present, we write a normalized title-only index that
+    // callers can query before falling back to fulltext.
+    let hasFulltextTitle;
+    try {
+      hasFulltextTitle = await database.schema.hasColumn(collection, 'fulltext_title');
+    } catch (err) {
+      logger.warn(`[fulltext] fulltext_title schema check failed for "${collection}": ${err.message}`);
+      hasFulltextTitle = false;
+    }
+
     const results = [];
 
     for (const id of keys) {
@@ -306,7 +317,17 @@ export default {
         // 6. Write fulltext
         // Leading/trailing spaces enable word-boundary _icontains ' token' queries.
         const fulltext = ' ' + parts.filter(Boolean).join(' ') + ' ';
-        await database(collection).where('id', id).update({ fulltext });
+
+        // Title-only index (same normalize + word boundary pattern) for title-first
+        // ranking. Queried separately by /explore dashboard to prioritize title
+        // matches over lyrics/metadata matches at the same LIMIT.
+        const update = { fulltext };
+        if (hasFulltextTitle) {
+          const titleNormalized = record.title != null ? normalize(record.title) : '';
+          update.fulltext_title = titleNormalized ? ' ' + titleNormalized + ' ' : '';
+        }
+
+        await database(collection).where('id', id).update(update);
 
         results.push({ id, fulltext });
       } catch (err) {
