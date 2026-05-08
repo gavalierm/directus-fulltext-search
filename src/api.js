@@ -376,7 +376,10 @@ export default {
 
         // 6. Write fulltext
         // Leading/trailing spaces enable word-boundary _icontains ' token' queries.
-        const fulltext = ' ' + parts.filter(Boolean).join(' ') + ' ';
+        // Dedup tokens (BPM/status/tag bilingual expansions môžu prekrývať user tagy
+        // alebo opakované slová v title); zachová word boundaries.
+        const tokens = parts.filter(Boolean).join(' ').split(/\s+/).filter(Boolean);
+        const fulltext = ' ' + [...new Set(tokens)].join(' ') + ' ';
 
         // Title-only index (same normalize + word boundary pattern) for title-first
         // ranking. Queried separately by /explore dashboard to prioritize title
