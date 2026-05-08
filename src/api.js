@@ -42,6 +42,37 @@ const STATUS_MAP = {
   archived: 'archivovane archived',
 };
 
+// CASCADES: keď trigger collection X je upravená/vytvorená,
+// reindex dependent records v target kolekciách.
+// Typy:
+//   - 'fk'       = direct FK column v target (X je referencované)
+//   - 'm2m'      = X je jeden z M2M endpoints, junction obsahuje vzťah
+//   - 'junction' = X je samotná junction tabuľka, column je parent FK
+const CASCADES = {
+  bands: [
+    { target: 'songs',    via: 'fk', column: 'band' },
+    { target: 'albums',   via: 'fk', column: 'band' },
+    { target: 'setlists', via: 'fk', column: 'band' },
+  ],
+  scale_keys: [
+    { target: 'songs',    via: 'fk', column: 'key' },
+  ],
+  authors: [
+    { target: 'songs',    via: 'm2m', junction: 'songs_authors',
+      sourceFK: 'authors_id', targetFK: 'songs_id' },
+  ],
+  translation_authors: [
+    { target: 'songs',    via: 'm2m', junction: 'songs_translation_authors',
+      sourceFK: 'translation_authors_id', targetFK: 'songs_id' },
+  ],
+  songs_authors: [
+    { target: 'songs',    via: 'junction', column: 'songs_id' },
+  ],
+  songs_translation_authors: [
+    { target: 'songs',    via: 'junction', column: 'songs_id' },
+  ],
+};
+
 const CONFIG = {
   songs: {
     fields: ['title', 'number'],
@@ -209,6 +240,36 @@ function extractLyricsSearchable(lyrics) {
   }
 
   return parts.join(' ');
+}
+
+// Resolve dependent record IDs for a cascade rule.
+// triggerCollection = the collection that fired the event (X)
+// rule = entry from CASCADES[X]
+// sourceKeys = IDs from the trigger payload
+//
+// Limitation: for `via: 'junction'` + DELETE events, junction rows are
+// already gone — query returns empty, cascade silently skipped.
+// Workaround: operator runs reindex-fulltext.py.
+async function resolveCascadeIds(database, triggerCollection, rule, sourceKeys) {
+  if (rule.via === 'fk') {
+    const rows = await database(rule.target)
+      .whereIn(rule.column, sourceKeys)
+      .select('id');
+    return rows.map((r) => r.id);
+  }
+  if (rule.via === 'm2m') {
+    const rows = await database(rule.junction)
+      .whereIn(rule.sourceFK, sourceKeys)
+      .select(rule.targetFK);
+    return [...new Set(rows.map((r) => r[rule.targetFK]).filter(Boolean))];
+  }
+  if (rule.via === 'junction') {
+    const rows = await database(triggerCollection)
+      .whereIn('id', sourceKeys)
+      .select(rule.column);
+    return [...new Set(rows.map((r) => r[rule.column]).filter(Boolean))];
+  }
+  return [];
 }
 
 // ===== HANDLER =====
