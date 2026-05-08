@@ -84,14 +84,14 @@ const CONFIG = {
       },
       bpm: (value) => {
         if (!value) return '';
-        const tags = new Set();
+        const out = new Set();
         for (const zone of Object.values(BPM_MAP)) {
           if (zone.min !== undefined && value < zone.min) continue;
           if (zone.max !== undefined && value > zone.max) continue;
-          for (const t of zone.tokens.split(' ')) tags.add(t);
+          for (const t of zone.tokens.split(' ')) out.add(t);
         }
-        tags.add(String(value));
-        return [...tags].join(' ');
+        out.add(String(value));
+        return [...out].join(' ');
       },
       lyrics: extractLyricsSearchable,
     },
