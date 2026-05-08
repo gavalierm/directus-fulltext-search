@@ -137,6 +137,29 @@ function normalize(str) {
     .trim();
 }
 
+// Stripped slug — bez medzier, interpunkcie, špec. znakov.
+// Komplementárny variant k normalize() pre name-like fields:
+// users hľadajúci "acdc" alebo "imtsmile" nájdu kapelu "AC/DC" / "IMT Smile!".
+function slugify(str) {
+  if (str == null) return '';
+  return String(str)
+    .normalize('NFD')
+    .replace(DIACRITICS_RE, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+// Push normalized + slug variant (ak sa líšia) do parts.
+// Použité pre name-like fieldy: title, fullname, label.
+// NIE pre lyrics (zbytočná expanzia bulk textu) ani auto-generované tokeny.
+function pushExpanded(parts, str) {
+  const norm = normalize(str);
+  if (!norm) return;
+  parts.push(norm);
+  const slug = slugify(str);
+  if (slug && slug !== norm) parts.push(slug);
+}
+
 // ===== LYRICS EXTRACTION =====
 
 const VERSE_ALIASES = /^(sloha|verse|vers)(\s*[\w\]]+)?$/i;
@@ -263,11 +286,11 @@ export default {
 
         const parts = [];
 
-        // 1. Direct text fields
+        // 1. Direct text fields (name-like → push expanded variant)
         for (const field of config.fields) {
           const value = record[field];
           if (value != null) {
-            parts.push(normalize(value));
+            pushExpanded(parts, value);
           }
         }
 
@@ -286,7 +309,7 @@ export default {
             });
 
           if (related && related[rel.field] != null) {
-            parts.push(normalize(related[rel.field]));
+            pushExpanded(parts, related[rel.field]);
           }
         }
 
@@ -308,7 +331,7 @@ export default {
 
               for (const row of relatedRows) {
                 if (row[m2m.relatedField] != null) {
-                  parts.push(normalize(row[m2m.relatedField]));
+                  pushExpanded(parts, row[m2m.relatedField]);
                 }
               }
             }
@@ -346,8 +369,8 @@ export default {
             });
 
           if (user) {
-            if (user.first_name) parts.push(normalize(user.first_name));
-            if (user.last_name) parts.push(normalize(user.last_name));
+            if (user.first_name) pushExpanded(parts, user.first_name);
+            if (user.last_name) pushExpanded(parts, user.last_name);
           }
         }
 
@@ -360,8 +383,9 @@ export default {
         // matches over lyrics/metadata matches at the same LIMIT.
         const update = { fulltext };
         if (hasFulltextTitle) {
-          const titleNormalized = record.title != null ? normalize(record.title) : '';
-          update.fulltext_title = titleNormalized ? ' ' + titleNormalized + ' ' : '';
+          const titleParts = [];
+          if (record.title != null) pushExpanded(titleParts, record.title);
+          update.fulltext_title = titleParts.length ? ' ' + titleParts.join(' ') + ' ' : '';
         }
 
         await database(collection).where('id', id).update(update);
