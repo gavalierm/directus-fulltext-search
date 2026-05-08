@@ -10,12 +10,36 @@
 
 // ===== KONFIGURÁCIA =====
 
+// SK↔EN bilingual pairs pre auto-generované tempo/status tokeny.
+// Používané pre user tag expanziu — ak operátor manuálne otaguje "slow",
+// pridá sa aj "pomale" (a opačne), aby quick filter "Pomalé" našiel pieseň.
+const BILINGUAL = new Map([
+  ['pomale', 'slow'],          ['slow', 'pomale'],
+  ['stredne', 'medium'],       ['medium', 'stredne'],
+  ['rychle', 'fast'],          ['fast', 'rychle'],
+  ['verejne', 'public'],       ['public', 'verejne'],
+  ['sukromne', 'private'],     ['private', 'sukromne'],
+  ['rozpracovane', 'draft'],   ['draft', 'rozpracovane'],
+  ['nezaradene', 'unlisted'],  ['unlisted', 'nezaradene'],
+  ['archivovane', 'archived'], ['archived', 'archivovane'],
+]);
+
+const BPM_OVERLAP = 5;
+
+// Zóny tempa s mäkkými hranicami. Boundaries 80 a 120 sú zobrazené explicitne
+// s overlap aritmetikou — čitateľnejšie než precomputed 85/75/125/115.
+const BPM_MAP = {
+  slow:   {                         max: 80 + BPM_OVERLAP,  tokens: 'pomale slow' },
+  medium: { min: 80 - BPM_OVERLAP,  max: 120 + BPM_OVERLAP, tokens: 'stredne medium' },
+  fast:   { min: 120 - BPM_OVERLAP,                         tokens: 'rychle fast' },
+};
+
 const STATUS_MAP = {
-  public: 'verejne',
-  private: 'sukromne',
-  draft: 'rozpracovane',
-  unlisted: 'nezaradene',
-  archived: 'archivovane',
+  public:   'verejne public',
+  private:  'sukromne private',
+  draft:    'rozpracovane draft',
+  unlisted: 'nezaradene unlisted',
+  archived: 'archivovane archived',
 };
 
 const CONFIG = {
@@ -44,17 +68,30 @@ const CONFIG = {
     transforms: {
       status: STATUS_MAP,
       tags: (value) => {
-        if (Array.isArray(value)) return value.join(' ');
-        return '';
+        if (!Array.isArray(value)) return '';
+        const out = new Set();
+        for (const tag of value) {
+          const norm = normalize(tag);
+          if (!norm) continue;
+          for (const token of norm.split(/\s+/)) {
+            if (!token) continue;
+            out.add(token);
+            const counterpart = BILINGUAL.get(token);
+            if (counterpart) out.add(counterpart);
+          }
+        }
+        return [...out].join(' ');
       },
       bpm: (value) => {
         if (!value) return '';
-        const parts = [];
-        if (value < 80) parts.push('pomale');
-        else if (value <= 120) parts.push('stredne');
-        else parts.push('rychle');
-        parts.push(String(value));
-        return parts.join(' ');
+        const tags = new Set();
+        for (const zone of Object.values(BPM_MAP)) {
+          if (zone.min !== undefined && value < zone.min) continue;
+          if (zone.max !== undefined && value > zone.max) continue;
+          for (const t of zone.tokens.split(' ')) tags.add(t);
+        }
+        tags.add(String(value));
+        return [...tags].join(' ');
       },
       lyrics: extractLyricsSearchable,
     },
