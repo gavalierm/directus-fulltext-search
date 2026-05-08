@@ -272,197 +272,205 @@ async function resolveCascadeIds(database, triggerCollection, rule, sourceKeys) 
   return [];
 }
 
+// ===== REINDEX HELPER =====
+
+// Reindex `keys` records in `collection`. Encapsulates the original per-record
+// logic (fields, FK, M2M, transforms, userCreated, fulltext + fulltext_title write).
+// Handler uses this for both own-collection reindex and cascade-resolved targets.
+async function reindexCollection(database, logger, collection, keys) {
+  const config = CONFIG[collection];
+  if (!config) {
+    return { skip: true, reason: `No fulltext config for collection "${collection}"` };
+  }
+
+  let hasFulltext;
+  try {
+    hasFulltext = await database.schema.hasColumn(collection, 'fulltext');
+  } catch (err) {
+    logger.error(`[fulltext] Schema check failed for "${collection}": ${err.message}`);
+    return { skip: true, reason: `Schema check failed: ${err.message}` };
+  }
+  if (!hasFulltext) {
+    logger.warn(`[fulltext] Collection "${collection}" has no fulltext column, skipping`);
+    return { skip: true, reason: `Collection "${collection}" has no fulltext column` };
+  }
+
+  // Optional: fulltext_title column for title-first ranking (not all deployments
+  // may have it yet). If present, we write a normalized title-only index that
+  // callers can query before falling back to fulltext.
+  let hasFulltextTitle;
+  try {
+    hasFulltextTitle = await database.schema.hasColumn(collection, 'fulltext_title');
+  } catch (err) {
+    logger.warn(`[fulltext] fulltext_title schema check failed for "${collection}": ${err.message}`);
+    hasFulltextTitle = false;
+  }
+
+  const results = [];
+
+  for (const id of keys) {
+    try {
+      // Build the list of direct fields to select
+      const selectFields = [
+        ...config.fields,
+        ...Object.keys(config.transforms || {}),
+        ...Object.keys(config.relations || {}),
+      ];
+
+      if (config.userCreated) {
+        selectFields.push('user_created');
+      }
+
+      const record = await database(collection)
+        .where('id', id)
+        .select(selectFields)
+        .first();
+
+      if (!record) {
+        logger.warn(`[fulltext] Record ${id} not found in "${collection}", skipping`);
+        continue;
+      }
+
+      const parts = [];
+
+      // 1. Direct text fields (name-like → push expanded variant)
+      for (const field of config.fields) {
+        const value = record[field];
+        if (value != null) {
+          pushExpanded(parts, value);
+        }
+      }
+
+      // 2. FK relations (e.g. band → bands.title)
+      for (const [fk, rel] of Object.entries(config.relations || {})) {
+        const fkValue = record[fk];
+        if (fkValue == null) continue;
+
+        const related = await database(rel.collection)
+          .where('id', fkValue)
+          .select(rel.field)
+          .first()
+          .catch((err) => {
+            logger.warn(`[fulltext] FK lookup failed: ${collection}.${fk} → ${rel.collection}: ${err.message}`);
+            return null;
+          });
+
+        if (related && related[rel.field] != null) {
+          pushExpanded(parts, related[rel.field]);
+        }
+      }
+
+      // 3. M2M relations (e.g. songs → songs_authors → authors.fullname)
+      for (const [name, m2m] of Object.entries(config.m2m || {})) {
+        try {
+          const junctionRows = await database(m2m.junction)
+            .where(m2m.junctionFK, id)
+            .select(m2m.relatedFK);
+
+          const relatedIds = junctionRows
+            .map((row) => row[m2m.relatedFK])
+            .filter(Boolean);
+
+          if (relatedIds.length) {
+            const relatedRows = await database(m2m.relatedCollection)
+              .whereIn('id', relatedIds)
+              .select(m2m.relatedField);
+
+            for (const row of relatedRows) {
+              if (row[m2m.relatedField] != null) {
+                pushExpanded(parts, row[m2m.relatedField]);
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn(`[fulltext] M2M lookup failed for "${name}" on ${collection}#${id}: ${err.message}`);
+        }
+      }
+
+      // 4. Transforms (status maps, custom functions)
+      for (const [field, transform] of Object.entries(config.transforms || {})) {
+        const value = record[field];
+        if (value == null) continue;
+
+        let text = '';
+        if (typeof transform === 'function') {
+          text = transform(value);
+        } else if (typeof transform === 'object') {
+          text = transform[value] || '';
+        }
+
+        if (text) {
+          parts.push(normalize(text));
+        }
+      }
+
+      // 5. User created (first_name, last_name)
+      if (config.userCreated && record.user_created) {
+        const user = await database('directus_users')
+          .where('id', record.user_created)
+          .select('first_name', 'last_name')
+          .first()
+          .catch((err) => {
+            logger.warn(`[fulltext] User lookup failed for ${record.user_created}: ${err.message}`);
+            return null;
+          });
+
+        if (user) {
+          if (user.first_name) pushExpanded(parts, user.first_name);
+          if (user.last_name) pushExpanded(parts, user.last_name);
+        }
+      }
+
+      // 6. Write fulltext
+      // Leading/trailing spaces enable word-boundary _icontains ' token' queries.
+      // Dedup tokens (BPM/status/tag bilingual expansions môžu prekrývať user tagy
+      // alebo opakované slová v title); zachová word boundaries.
+      const tokens = parts.filter(Boolean).join(' ').split(/\s+/).filter(Boolean);
+      const fulltext = ' ' + [...new Set(tokens)].join(' ') + ' ';
+
+      // Title-only index (same normalize + word boundary pattern) for title-first
+      // ranking. Queried separately by /explore dashboard to prioritize title
+      // matches over lyrics/metadata matches at the same LIMIT.
+      const update = { fulltext };
+      if (hasFulltextTitle) {
+        const titleParts = [];
+        if (record.title != null) pushExpanded(titleParts, record.title);
+        update.fulltext_title = titleParts.length ? ' ' + titleParts.join(' ') + ' ' : '';
+      }
+
+      await database(collection).where('id', id).update(update);
+
+      results.push({ id, fulltext });
+    } catch (err) {
+      logger.error(`[fulltext] Failed to process ${collection}#${id}: ${err.message}`);
+    }
+  }
+
+  if (results.length < keys.length) {
+    logger.warn(`[fulltext] Partial update: ${results.length}/${keys.length} record(s) in "${collection}"`);
+  }
+  return { updated: results.length, results };
+}
+
 // ===== HANDLER =====
 
 export default {
   id: 'fulltext-search',
   handler: async (options, { database, logger, data }) => {
     const collection = options.collection || data.$trigger?.collection;
-    const keys = options.keys || data.$trigger?.keys || (data.$trigger?.key ? [data.$trigger.key] : []);
+    const keys = options.keys || data.$trigger?.keys
+      || (data.$trigger?.key ? [data.$trigger.key] : []);
 
     if (!collection) {
       logger.warn('[fulltext] No collection in trigger or options, skipping');
       return { skip: true, reason: 'No collection in trigger or options' };
     }
-
     if (!keys.length) {
       logger.warn(`[fulltext] No keys in trigger or options for "${collection}", skipping`);
       return { skip: true, reason: 'No keys in trigger or options' };
     }
 
-    const config = CONFIG[collection];
-    if (!config) {
-      return { skip: true, reason: `No fulltext config for collection "${collection}"` };
-    }
-
-    // Check if the collection has a fulltext column
-    let hasFulltext;
-    try {
-      hasFulltext = await database.schema.hasColumn(collection, 'fulltext');
-    } catch (err) {
-      logger.error(`[fulltext] Schema check failed for "${collection}": ${err.message}`);
-      return { skip: true, reason: `Schema check failed: ${err.message}` };
-    }
-
-    if (!hasFulltext) {
-      logger.warn(`[fulltext] Collection "${collection}" has no fulltext column, skipping`);
-      return { skip: true, reason: `Collection "${collection}" has no fulltext column` };
-    }
-
-    // Optional: fulltext_title column for title-first ranking (not all deployments
-    // may have it yet). If present, we write a normalized title-only index that
-    // callers can query before falling back to fulltext.
-    let hasFulltextTitle;
-    try {
-      hasFulltextTitle = await database.schema.hasColumn(collection, 'fulltext_title');
-    } catch (err) {
-      logger.warn(`[fulltext] fulltext_title schema check failed for "${collection}": ${err.message}`);
-      hasFulltextTitle = false;
-    }
-
-    const results = [];
-
-    for (const id of keys) {
-      try {
-        // Build the list of direct fields to select
-        const selectFields = [
-          ...config.fields,
-          ...Object.keys(config.transforms || {}),
-          ...Object.keys(config.relations || {}),
-        ];
-
-        if (config.userCreated) {
-          selectFields.push('user_created');
-        }
-
-        const record = await database(collection)
-          .where('id', id)
-          .select(selectFields)
-          .first();
-
-        if (!record) {
-          logger.warn(`[fulltext] Record ${id} not found in "${collection}", skipping`);
-          continue;
-        }
-
-        const parts = [];
-
-        // 1. Direct text fields (name-like → push expanded variant)
-        for (const field of config.fields) {
-          const value = record[field];
-          if (value != null) {
-            pushExpanded(parts, value);
-          }
-        }
-
-        // 2. FK relations (e.g. band → bands.title)
-        for (const [fk, rel] of Object.entries(config.relations || {})) {
-          const fkValue = record[fk];
-          if (fkValue == null) continue;
-
-          const related = await database(rel.collection)
-            .where('id', fkValue)
-            .select(rel.field)
-            .first()
-            .catch((err) => {
-              logger.warn(`[fulltext] FK lookup failed: ${collection}.${fk} → ${rel.collection}: ${err.message}`);
-              return null;
-            });
-
-          if (related && related[rel.field] != null) {
-            pushExpanded(parts, related[rel.field]);
-          }
-        }
-
-        // 3. M2M relations (e.g. songs → songs_authors → authors.fullname)
-        for (const [name, m2m] of Object.entries(config.m2m || {})) {
-          try {
-            const junctionRows = await database(m2m.junction)
-              .where(m2m.junctionFK, id)
-              .select(m2m.relatedFK);
-
-            const relatedIds = junctionRows
-              .map((row) => row[m2m.relatedFK])
-              .filter(Boolean);
-
-            if (relatedIds.length) {
-              const relatedRows = await database(m2m.relatedCollection)
-                .whereIn('id', relatedIds)
-                .select(m2m.relatedField);
-
-              for (const row of relatedRows) {
-                if (row[m2m.relatedField] != null) {
-                  pushExpanded(parts, row[m2m.relatedField]);
-                }
-              }
-            }
-          } catch (err) {
-            logger.warn(`[fulltext] M2M lookup failed for "${name}" on ${collection}#${id}: ${err.message}`);
-          }
-        }
-
-        // 4. Transforms (status maps, custom functions)
-        for (const [field, transform] of Object.entries(config.transforms || {})) {
-          const value = record[field];
-          if (value == null) continue;
-
-          let text = '';
-          if (typeof transform === 'function') {
-            text = transform(value);
-          } else if (typeof transform === 'object') {
-            text = transform[value] || '';
-          }
-
-          if (text) {
-            parts.push(normalize(text));
-          }
-        }
-
-        // 5. User created (first_name, last_name)
-        if (config.userCreated && record.user_created) {
-          const user = await database('directus_users')
-            .where('id', record.user_created)
-            .select('first_name', 'last_name')
-            .first()
-            .catch((err) => {
-              logger.warn(`[fulltext] User lookup failed for ${record.user_created}: ${err.message}`);
-              return null;
-            });
-
-          if (user) {
-            if (user.first_name) pushExpanded(parts, user.first_name);
-            if (user.last_name) pushExpanded(parts, user.last_name);
-          }
-        }
-
-        // 6. Write fulltext
-        // Leading/trailing spaces enable word-boundary _icontains ' token' queries.
-        // Dedup tokens (BPM/status/tag bilingual expansions môžu prekrývať user tagy
-        // alebo opakované slová v title); zachová word boundaries.
-        const tokens = parts.filter(Boolean).join(' ').split(/\s+/).filter(Boolean);
-        const fulltext = ' ' + [...new Set(tokens)].join(' ') + ' ';
-
-        // Title-only index (same normalize + word boundary pattern) for title-first
-        // ranking. Queried separately by /explore dashboard to prioritize title
-        // matches over lyrics/metadata matches at the same LIMIT.
-        const update = { fulltext };
-        if (hasFulltextTitle) {
-          const titleParts = [];
-          if (record.title != null) pushExpanded(titleParts, record.title);
-          update.fulltext_title = titleParts.length ? ' ' + titleParts.join(' ') + ' ' : '';
-        }
-
-        await database(collection).where('id', id).update(update);
-
-        results.push({ id, fulltext });
-      } catch (err) {
-        logger.error(`[fulltext] Failed to process ${collection}#${id}: ${err.message}`);
-      }
-    }
-
-    if (results.length < keys.length) {
-      logger.warn(`[fulltext] Partial update: ${results.length}/${keys.length} record(s) in "${collection}"`);
-    }
-    return { updated: results.length, collection, results };
+    const result = await reindexCollection(database, logger, collection, keys);
+    return { collection, ...result };
   },
 };
