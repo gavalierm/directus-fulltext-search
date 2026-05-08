@@ -457,20 +457,48 @@ async function reindexCollection(database, logger, collection, keys) {
 export default {
   id: 'fulltext-search',
   handler: async (options, { database, logger, data }) => {
-    const collection = options.collection || data.$trigger?.collection;
-    const keys = options.keys || data.$trigger?.keys
+    const triggerCollection = options.collection || data.$trigger?.collection;
+    const triggerKeys = options.keys || data.$trigger?.keys
       || (data.$trigger?.key ? [data.$trigger.key] : []);
 
-    if (!collection) {
+    if (!triggerCollection) {
       logger.warn('[fulltext] No collection in trigger or options, skipping');
       return { skip: true, reason: 'No collection in trigger or options' };
     }
-    if (!keys.length) {
-      logger.warn(`[fulltext] No keys in trigger or options for "${collection}", skipping`);
+    if (!triggerKeys.length) {
+      logger.warn(`[fulltext] No keys in trigger or options for "${triggerCollection}", skipping`);
       return { skip: true, reason: 'No keys in trigger or options' };
     }
 
-    const result = await reindexCollection(database, logger, collection, keys);
-    return { collection, ...result };
+    // Build dispatch list: { collection, keys }[]
+    // 1. If trigger collection has its own fulltext config → reindex own
+    // 2. If trigger collection has cascades → resolve dependent IDs per rule
+    const dispatch = [];
+
+    if (CONFIG[triggerCollection]) {
+      dispatch.push({ collection: triggerCollection, keys: triggerKeys });
+    }
+
+    for (const rule of CASCADES[triggerCollection] || []) {
+      try {
+        const ids = await resolveCascadeIds(database, triggerCollection, rule, triggerKeys);
+        if (ids.length) {
+          dispatch.push({ collection: rule.target, keys: ids });
+        }
+      } catch (err) {
+        logger.warn(`[fulltext] Cascade ${triggerCollection} → ${rule.target} failed: ${err.message}`);
+      }
+    }
+
+    if (!dispatch.length) {
+      return { skip: true, reason: `No reindex target for "${triggerCollection}"` };
+    }
+
+    const dispatched = [];
+    for (const { collection, keys } of dispatch) {
+      const r = await reindexCollection(database, logger, collection, keys);
+      dispatched.push({ collection, keys: keys.length, ...r });
+    }
+    return { trigger: triggerCollection, dispatched };
   },
 };
