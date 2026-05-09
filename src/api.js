@@ -459,14 +459,37 @@ async function reindexCollection(database, logger, collection, keys) {
 export default {
   id: 'fulltext-search',
   handler: async (options, { database, logger, data }) => {
-    const triggerCollection = options.collection || data.$trigger?.collection;
-    const triggerKeys = options.keys || data.$trigger?.keys
+    // Trigger sources, in priority order:
+    //   - operation options (hardcoded in flow)
+    //   - $trigger.collection/keys (event flow — items.create/update fires with these)
+    //   - $trigger.body.collection/keys (manual/webhook flow with JSON payload)
+    const triggerCollection = options.collection
+      || data.$trigger?.collection
+      || data.$trigger?.body?.collection;
+    let triggerKeys = options.keys
+      || data.$trigger?.keys
+      || data.$trigger?.body?.keys
       || (data.$trigger?.key ? [data.$trigger.key] : []);
 
     if (!triggerCollection) {
       logger.warn('[fulltext] No collection in trigger or options, skipping');
       return { skip: true, reason: 'No collection in trigger or options' };
     }
+
+    // reindexAll mode — fetch all IDs from collection if no keys supplied.
+    // Used for manual full-collection rebuilds without going through items.update
+    // (which would bump date_updated/user_updated audit fields).
+    if (options.reindexAll && !triggerKeys.length) {
+      try {
+        const rows = await database(triggerCollection).select('id');
+        triggerKeys = rows.map((r) => r.id);
+        logger.info(`[fulltext] reindexAll: ${triggerKeys.length} records in "${triggerCollection}"`);
+      } catch (err) {
+        logger.error(`[fulltext] reindexAll failed for "${triggerCollection}": ${err.message}`);
+        return { skip: true, reason: `reindexAll fetch failed: ${err.message}` };
+      }
+    }
+
     if (!triggerKeys.length) {
       logger.warn(`[fulltext] No keys in trigger or options for "${triggerCollection}", skipping`);
       return { skip: true, reason: 'No keys in trigger or options' };
