@@ -114,14 +114,16 @@ const CONFIG = {
         return [...out].join(' ');
       },
       bpm: (value) => {
-        if (!value) return '';
+        // DB stores bpm ako DECIMAL → coerce na integer aby sa "123.00" nerozdelilo na "123 00".
+        const bpm = Math.trunc(Number(value));
+        if (!bpm) return '';
         const out = new Set();
         for (const zone of Object.values(BPM_MAP)) {
-          if (zone.min !== undefined && value < zone.min) continue;
-          if (zone.max !== undefined && value > zone.max) continue;
+          if (zone.min !== undefined && bpm < zone.min) continue;
+          if (zone.max !== undefined && bpm > zone.max) continue;
           for (const t of zone.tokens.split(' ')) out.add(t);
         }
-        out.add(String(value));
+        out.add(String(bpm));
         return [...out].join(' ');
       },
       lyrics: extractLyricsSearchable,
