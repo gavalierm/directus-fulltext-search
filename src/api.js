@@ -8,6 +8,8 @@
  * Safety: If the collection has no `fulltext` column, skips gracefully.
  */
 
+import { notifyAdmins } from './shared/notify-admin.js';
+
 // ===== KONFIGURÁCIA =====
 
 // SK↔EN bilingual pairs pre auto-generované tempo/status tokeny.
@@ -279,7 +281,7 @@ async function resolveCascadeIds(database, triggerCollection, rule, sourceKeys) 
 // Reindex `keys` records in `collection`. Encapsulates the original per-record
 // logic (fields, FK, M2M, transforms, userCreated, fulltext + fulltext_title write).
 // Handler uses this for both own-collection reindex and cascade-resolved targets.
-async function reindexCollection(database, logger, collection, keys) {
+async function reindexCollection(database, logger, collection, keys, notifyCtx) {
   const config = CONFIG[collection];
   if (!config) {
     return { skip: true, reason: `No fulltext config for collection "${collection}"` };
@@ -290,6 +292,7 @@ async function reindexCollection(database, logger, collection, keys) {
     hasFulltext = await database.schema.hasColumn(collection, 'fulltext');
   } catch (err) {
     logger.error(`[fulltext] Schema check failed for "${collection}": ${err.message}`);
+    await notifyAdmins(notifyCtx, 'fulltext:schema-check', err, { collection });
     return { skip: true, reason: `Schema check failed: ${err.message}` };
   }
   if (!hasFulltext) {
@@ -445,6 +448,7 @@ async function reindexCollection(database, logger, collection, keys) {
       results.push({ id, fulltext });
     } catch (err) {
       logger.error(`[fulltext] Failed to process ${collection}#${id}: ${err.message}`);
+      await notifyAdmins(notifyCtx, 'fulltext:process-record', err, { collection, id });
     }
   }
 
@@ -458,7 +462,9 @@ async function reindexCollection(database, logger, collection, keys) {
 
 export default {
   id: 'fulltext-search',
-  handler: async (options, { database, logger, data }) => {
+  handler: async (options, context) => {
+    const { database, logger, data } = context;
+    const notifyCtx = { services: context.services, database, getSchema: context.getSchema, logger, env: context.env };
     // Trigger sources, in priority order:
     //   - operation options (hardcoded in flow)
     //   - $trigger.collection/keys (event flow — items.create/update fires with these)
@@ -486,6 +492,7 @@ export default {
         logger.info(`[fulltext] reindexAll: ${triggerKeys.length} records in "${triggerCollection}"`);
       } catch (err) {
         logger.error(`[fulltext] reindexAll failed for "${triggerCollection}": ${err.message}`);
+        await notifyAdmins(notifyCtx, 'fulltext:reindexAll', err, { collection: triggerCollection });
         return { skip: true, reason: `reindexAll fetch failed: ${err.message}` };
       }
     }
@@ -521,7 +528,7 @@ export default {
 
     const dispatched = [];
     for (const { collection, keys } of dispatch) {
-      const r = await reindexCollection(database, logger, collection, keys);
+      const r = await reindexCollection(database, logger, collection, keys, notifyCtx);
       dispatched.push({ collection, keys: keys.length, ...r });
     }
     return { trigger: triggerCollection, dispatched };
